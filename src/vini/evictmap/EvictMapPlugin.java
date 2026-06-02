@@ -12,12 +12,14 @@ import mindustry.world.Tile;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
@@ -52,7 +54,14 @@ public class EvictMapPlugin extends Plugin {
     private static final int ROWS = 6;
 
     private static final int OUTER_RADIUS = 38;
-    private static final int HORIZONTAL_DX = 75;
+
+    // Important: "75 tiles from center to center" was counted inclusively
+    // in the editor. Tile coordinates differ by 74. Using 75 puts the
+    // shared middle exactly between two tile columns and creates a 2-tile
+    // center everywhere.
+    private static final int HORIZONTAL_DX = 74;
+
+    // With 74 horizontal distance, 37 is the exact half-row shift.
     private static final int DIAGONAL_DX = 37;
     private static final int DIAGONAL_DY = 64;
 
@@ -127,7 +136,7 @@ public class EvictMapPlugin extends Plugin {
             }
         });
 
-        Log.info("[EvictMapGenerator] Loaded. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.1.4. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -395,12 +404,61 @@ public class EvictMapPlugin extends Plugin {
         Map<Cell, Point> centers,
         Map<Edge, EdgeType> edgeTypes
     ) {
-        int height = zones.length;
-        int width = zones[0].length;
+        /**
+         * Important raster rule:
+         *
+         * Mindustry uses square tiles. Several grey edge regions touch each other
+         * near the red triangle tips. The previous prototype let multiple edges
+         * edit the same tile. The edge processed last could therefore slightly
+         * distort a neighbouring triangle.
+         *
+         * Now every editable grey tile is assigned to exactly one edge first.
+         * Afterwards each template edits only its own fixed tile mask.
+         */
+        Map<Edge, Set<TilePoint>> tilesByEdge =
+            buildOwnedEdgeMasks(zones, centers, edgeTypes.keySet());
 
         for (Map.Entry<Edge, EdgeType> entry : edgeTypes.entrySet()) {
             Edge edge = entry.getKey();
             EdgeType edgeType = entry.getValue();
+            Set<TilePoint> mask = tilesByEdge.getOrDefault(edge, Collections.emptySet());
+
+            switch (edgeType) {
+                case FULL -> {
+                    for (TilePoint point : mask) {
+                        walls[point.y][point.x] = true;
+                    }
+                }
+
+                case OPEN -> {
+                    for (TilePoint point : mask) {
+                        walls[point.y][point.x] = false;
+                    }
+                }
+
+                case PASSAGE -> applyPassageTemplate(walls, centers, edge, mask);
+
+                case THIN -> applyOneTileThinWallTemplate(walls, centers, edge, mask);
+            }
+        }
+    }
+
+    private Map<Edge, Set<TilePoint>> buildOwnedEdgeMasks(
+        byte[][] zones,
+        Map<Cell, Point> centers,
+        Set<Edge> edges
+    ) {
+        int height = zones.length;
+        int width = zones[0].length;
+
+        List<Edge> orderedEdges = new ArrayList<>(edges);
+        orderedEdges.sort(edgeComparator());
+
+        Map<Edge, Set<TilePoint>> tilesByEdge = new LinkedHashMap<>();
+        Map<TilePoint, EdgeOwnership> ownerByTile = new HashMap<>();
+
+        for (Edge edge : orderedEdges) {
+            tilesByEdge.put(edge, new LinkedHashSet<>());
 
             Point a = centers.get(edge.a);
             Point b = centers.get(edge.b);
@@ -411,8 +469,6 @@ public class EvictMapPlugin extends Plugin {
 
             double ux = dx / distance;
             double uy = dy / distance;
-            double vx = -uy;
-            double vy = ux;
 
             double gapHalf = Math.max(0.0, distance / 2.0 - supportDistance(ux, uy));
 
@@ -433,31 +489,342 @@ public class EvictMapPlugin extends Plugin {
 
                     double relX = x - middleX;
                     double relY = y - middleY;
-
                     double u = relX * ux + relY * uy;
-                    double v = relX * vx + relY * vy;
 
                     if (Math.abs(u) > gapHalf + 0.75) {
                         continue;
                     }
 
-                    boolean insideA = squaredDistance(x, y, a.x, a.y) <= OUTER_RADIUS * OUTER_RADIUS;
-                    boolean insideB = squaredDistance(x, y, b.x, b.y) <= OUTER_RADIUS * OUTER_RADIUS;
+                    boolean insideA =
+                        squaredDistance(x, y, a.x, a.y) <= OUTER_RADIUS * OUTER_RADIUS;
+
+                    boolean insideB =
+                        squaredDistance(x, y, b.x, b.y) <= OUTER_RADIUS * OUTER_RADIUS;
 
                     if (!insideA && !insideB) {
                         continue;
                     }
 
-                    switch (edgeType) {
-                        case FULL -> walls[y][x] = true;
-                        case OPEN -> walls[y][x] = false;
-                        case THIN -> walls[y][x] = Math.abs(u) <= THIN_WALL_HALF_WIDTH;
-                        case PASSAGE -> walls[y][x] = !(Math.abs(v) < PASSAGE_WIDTH / 2.0);
+                    TilePoint tile = new TilePoint(x, y);
+                    double score = relX * relX + relY * relY;
+
+                    EdgeOwnership current = ownerByTile.get(tile);
+
+                    if (
+                        current == null
+                            || score < current.score - 1e-9
+                            || (
+                                Math.abs(score - current.score) <= 1e-9
+                                    && edgeComparator().compare(edge, current.edge) < 0
+                            )
+                    ) {
+                        ownerByTile.put(tile, new EdgeOwnership(edge, score));
                     }
                 }
             }
         }
+
+        for (Map.Entry<TilePoint, EdgeOwnership> entry : ownerByTile.entrySet()) {
+            tilesByEdge.get(entry.getValue().edge).add(entry.getKey());
+        }
+
+        return tilesByEdge;
     }
+
+    private void applyOneTileThinWallTemplate(
+        boolean[][] walls,
+        Map<Cell, Point> centers,
+        Edge edge,
+        Set<TilePoint> mask
+    ) {
+        /**
+         * A mathematically centered line can lie exactly between two tile rows.
+         * Selecting every tile with distance <= 0.5 would then create a two-tile
+         * wall. Instead, rasterize one digital line with Bresenham's algorithm.
+         * This always produces a line exactly one tile thick.
+         */
+        for (TilePoint point : mask) {
+            walls[point.y][point.x] = false;
+        }
+
+        if (mask.isEmpty()) {
+            return;
+        }
+
+        Point a = centers.get(edge.a);
+        Point b = centers.get(edge.b);
+
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double distance = Math.hypot(dx, dy);
+
+        double vx = -dy / distance;
+        double vy = dx / distance;
+
+        double middleX = (a.x + b.x) / 2.0;
+        double middleY = (a.y + b.y) / 2.0;
+
+        TilePoint first = null;
+        TilePoint last = null;
+        double minimumV = Double.POSITIVE_INFINITY;
+        double maximumV = Double.NEGATIVE_INFINITY;
+
+        for (TilePoint tile : mask) {
+            double v = (tile.x - middleX) * vx + (tile.y - middleY) * vy;
+
+            if (v < minimumV) {
+                minimumV = v;
+                first = tile;
+            }
+
+            if (v > maximumV) {
+                maximumV = v;
+                last = tile;
+            }
+        }
+
+        if (first == null || last == null) {
+            return;
+        }
+
+        int startX = deterministicRound(middleX + minimumV * vx);
+        int startY = deterministicRound(middleY + minimumV * vy);
+        int endX = deterministicRound(middleX + maximumV * vx);
+        int endY = deterministicRound(middleY + maximumV * vy);
+
+        Set<TilePoint> line = rasterizeOneTileLine(startX, startY, endX, endY);
+
+        for (TilePoint tile : line) {
+            if (mask.contains(tile)) {
+                walls[tile.y][tile.x] = true;
+            }
+        }
+    }
+
+    private void applyPassageTemplate(
+        boolean[][] walls,
+        Map<Cell, Point> centers,
+        Edge edge,
+        Set<TilePoint> mask
+    ) {
+        Point a = centers.get(edge.a);
+        Point b = centers.get(edge.b);
+
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double distance = Math.hypot(dx, dy);
+
+        double vx = -dy / distance;
+        double vy = dx / distance;
+
+        double middleX = (a.x + b.x) / 2.0;
+        double middleY = (a.y + b.y) / 2.0;
+
+        for (TilePoint tile : mask) {
+            double v = (tile.x - middleX) * vx + (tile.y - middleY) * vy;
+
+            walls[tile.y][tile.x] = !(Math.abs(v) < PASSAGE_WIDTH / 2.0);
+        }
+    }
+
+    private Set<TilePoint> rasterizeOneTileLine(
+        int startX,
+        int startY,
+        int endX,
+        int endY
+    ) {
+        Set<TilePoint> line = new LinkedHashSet<>();
+
+        int x = startX;
+        int y = startY;
+
+        int deltaX = Math.abs(endX - startX);
+        int deltaY = Math.abs(endY - startY);
+
+        int stepX = startX < endX ? 1 : -1;
+        int stepY = startY < endY ? 1 : -1;
+
+        int error = deltaX - deltaY;
+
+        while (true) {
+            line.add(new TilePoint(x, y));
+
+            if (x == endX && y == endY) {
+                break;
+            }
+
+            int doubledError = error * 2;
+
+            if (doubledError > -deltaY) {
+                error -= deltaY;
+                x += stepX;
+            }
+
+            if (doubledError < deltaX) {
+                error += deltaX;
+                y += stepY;
+            }
+        }
+
+        return line;
+    }
+
+    private int deterministicRound(double value) {
+        /**
+         * Java's normal round() would also work most of the time, but this
+         * explicitly resolves exact half-tile positions in one consistent way.
+         */
+        return (int)Math.floor(value + 0.5);
+    }
+
+    private Comparator<Edge> edgeComparator() {
+        return Comparator
+            .comparingInt((Edge edge) -> edge.a.row)
+            .thenComparingInt(edge -> edge.a.col)
+            .thenComparingInt(edge -> edge.b.row)
+            .thenComparingInt(edge -> edge.b.col);
+    }
+
+
+    private void enforceThinWallsLast(
+        boolean[][] walls,
+        byte[][] zones,
+        Map<Cell, Point> centers,
+        Map<Edge, EdgeType> edgeTypes
+    ) {
+        /**
+         * A thin wall must be exactly one tile thick.
+         *
+         * Even after assigning edge ownership, another nearby template can touch
+         * the same visual corridor close to the triangle tips. Therefore thin
+         * walls get a final cleanup pass after every other template:
+         *
+         * 1. clear the complete grey corridor for this edge
+         * 2. draw one single digital center line
+         *
+         * For a half-tile midpoint, one side is selected consistently.
+         */
+        for (Map.Entry<Edge, EdgeType> entry : edgeTypes.entrySet()) {
+            if (entry.getValue() != EdgeType.THIN) {
+                continue;
+            }
+
+            Edge edge = entry.getKey();
+            Set<TilePoint> corridor = collectRawBridgeMask(zones, centers, edge);
+
+            for (TilePoint tile : corridor) {
+                walls[tile.y][tile.x] = false;
+            }
+
+            drawSingleCenteredLine(walls, centers, edge, corridor);
+        }
+    }
+
+    private Set<TilePoint> collectRawBridgeMask(
+        byte[][] zones,
+        Map<Cell, Point> centers,
+        Edge edge
+    ) {
+        int height = zones.length;
+        int width = zones[0].length;
+
+        Set<TilePoint> corridor = new LinkedHashSet<>();
+
+        Point a = centers.get(edge.a);
+        Point b = centers.get(edge.b);
+
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double distance = Math.hypot(dx, dy);
+
+        double ux = dx / distance;
+        double uy = dy / distance;
+
+        double gapHalf = Math.max(0.0, distance / 2.0 - supportDistance(ux, uy));
+
+        double middleX = (a.x + b.x) / 2.0;
+        double middleY = (a.y + b.y) / 2.0;
+
+        int reach = OUTER_RADIUS + 2;
+        int minX = Math.max(0, (int)Math.floor(middleX - reach));
+        int maxX = Math.min(width - 1, (int)Math.ceil(middleX + reach));
+        int minY = Math.max(0, (int)Math.floor(middleY - reach));
+        int maxY = Math.min(height - 1, (int)Math.ceil(middleY + reach));
+
+        for (int y = minY; y <= maxY; y++) {
+            for (int x = minX; x <= maxX; x++) {
+                if (zones[y][x] != 1) {
+                    continue;
+                }
+
+                double relX = x - middleX;
+                double relY = y - middleY;
+                double u = relX * ux + relY * uy;
+
+                if (Math.abs(u) > gapHalf + 0.75) {
+                    continue;
+                }
+
+                boolean insideA =
+                    squaredDistance(x, y, a.x, a.y) <= OUTER_RADIUS * OUTER_RADIUS;
+
+                boolean insideB =
+                    squaredDistance(x, y, b.x, b.y) <= OUTER_RADIUS * OUTER_RADIUS;
+
+                if (insideA || insideB) {
+                    corridor.add(new TilePoint(x, y));
+                }
+            }
+        }
+
+        return corridor;
+    }
+
+    private void drawSingleCenteredLine(
+        boolean[][] walls,
+        Map<Cell, Point> centers,
+        Edge edge,
+        Set<TilePoint> corridor
+    ) {
+        if (corridor.isEmpty()) {
+            return;
+        }
+
+        Point a = centers.get(edge.a);
+        Point b = centers.get(edge.b);
+
+        double dx = b.x - a.x;
+        double dy = b.y - a.y;
+        double distance = Math.hypot(dx, dy);
+
+        // v points along the wall line, perpendicular to the line between cores.
+        double vx = -dy / distance;
+        double vy = dx / distance;
+
+        double middleX = (a.x + b.x) / 2.0;
+        double middleY = (a.y + b.y) / 2.0;
+
+        double minimumV = Double.POSITIVE_INFINITY;
+        double maximumV = Double.NEGATIVE_INFINITY;
+
+        for (TilePoint tile : corridor) {
+            double v = (tile.x - middleX) * vx + (tile.y - middleY) * vy;
+            minimumV = Math.min(minimumV, v);
+            maximumV = Math.max(maximumV, v);
+        }
+
+        int startX = deterministicRound(middleX + minimumV * vx);
+        int startY = deterministicRound(middleY + minimumV * vy);
+        int endX = deterministicRound(middleX + maximumV * vx);
+        int endY = deterministicRound(middleY + maximumV * vy);
+
+        for (TilePoint tile : rasterizeOneTileLine(startX, startY, endX, endY)) {
+            if (corridor.contains(tile)) {
+                walls[tile.y][tile.x] = true;
+            }
+        }
+    }
+
 
     private void applyTerrainToWorld(boolean[][] walls) {
         int width = Vars.world.width();
@@ -974,6 +1341,12 @@ public class EvictMapPlugin extends Plugin {
     }
 
     private record Point(int x, int y) {
+    }
+
+    private record TilePoint(int x, int y) {
+    }
+
+    private record EdgeOwnership(Edge edge, double score) {
     }
 
     private record Edge(Cell a, Cell b) {
