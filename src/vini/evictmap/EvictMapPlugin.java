@@ -31,6 +31,8 @@ import java.util.Set;
  * - 6x6 staggered hex grid
  * - rare completely filled hexes, biased toward map edges
  * - no separated playable sectors
+ * - equal 25% initial chance for each connection template
+ * - only the minimum number of edges is repaired if a seed would split the map
  * - four wall / connection templates
  *
  * Deliberately not included yet:
@@ -87,10 +89,10 @@ public class EvictMapPlugin extends Plugin {
     // Adjustable probabilities
     // ---------------------------------------------------------------------
 
-    private static final double FULL_WEIGHT = 0.10;
-    private static final double THIN_WEIGHT = 0.2333333333;
-    private static final double OPEN_WEIGHT = 0.4333333333;
-    private static final double PASSAGE_WEIGHT = 0.2333333334;
+    private static final double FULL_WEIGHT = 0.25;
+    private static final double THIN_WEIGHT = 0.25;
+    private static final double OPEN_WEIGHT = 0.25;
+    private static final double PASSAGE_WEIGHT = 0.25;
 
     private static final double FILLED_HEX_BORDER_CHANCE = 0.11;
     private static final double FILLED_HEX_SECOND_RING_CHANCE = 0.035;
@@ -245,33 +247,29 @@ public class EvictMapPlugin extends Plugin {
             }
         }
 
-        Set<Edge> backbone = buildRandomSpanningTree(normalCells, random);
-
         Map<Edge, EdgeType> edgeTypes = new LinkedHashMap<>();
         for (Edge edge : uniqueEdges(normalCells)) {
-            if (backbone.contains(edge)) {
-                edgeTypes.put(edge, chooseTraversableEdgeType(random));
-            } else {
-                edgeTypes.put(edge, chooseEdgeType(random));
-            }
+            edgeTypes.put(edge, chooseEdgeType(random));
         }
+
+        Set<Edge> repairedConnectivityEdges =
+            ensureTraversableConnectivity(normalCells, edgeTypes, random);
 
         Map<Cell, Point> centers = translatedCenters(worldWidth, worldHeight);
         byte[][] zones = createZoneMap(worldWidth, worldHeight, centers, normalCells);
         boolean[][] walls = createWallMap(worldWidth, worldHeight, zones);
 
-        carveRoundedOuterCaps(walls, zones, centers, normalCells);
         applyConnectionTemplates(walls, zones, centers, edgeTypes);
         applyTerrainToWorld(walls);
 
         lastSeed = seed;
 
         Log.info(
-            "[EvictMapGenerator] Done. seed=@ normalHexes=@ filledHexes=@ guaranteedNetworkEdges=@",
+            "[EvictMapGenerator] Done. seed=@ normalHexes=@ filledHexes=@ repairedConnectivityEdges=@",
             seed,
             normalCells.size(),
             filledCells.size(),
-            backbone.size()
+            repairedConnectivityEdges.size()
         );
     }
 
@@ -322,8 +320,11 @@ public class EvictMapPlugin extends Plugin {
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                // Everything starts as wall except the guaranteed inner polygons.
-                walls[y][x] = zones[y][x] != 2;
+                // Outside every active outer circle is fixed Dirt Wall.
+                // Everything reached by a circle starts as floor. Connection
+                // templates add walls only between two normal neighbouring hexes.
+                // This makes all map-border and full-hex-facing sides perfectly round.
+                walls[y][x] = zones[y][x] == 0;
             }
         }
 
@@ -600,44 +601,108 @@ public class EvictMapPlugin extends Plugin {
         return visited.size() == cellSet.size();
     }
 
-    private Set<Edge> buildRandomSpanningTree(List<Cell> normalCells, Random random) {
-        Set<Cell> cellSet = new HashSet<>(normalCells);
-        Set<Cell> visited = new HashSet<>();
-        Set<Edge> tree = new HashSet<>();
-        Deque<Cell> stack = new ArrayDeque<>();
+    private Set<Edge> ensureTraversableConnectivity(
+        List<Cell> normalCells,
+        Map<Edge, EdgeType> edgeTypes,
+        Random random
+    ) {
+        /**
+         * First, every normal-normal edge is rolled with the normal 25/25/25/25
+         * probabilities. Only if this creates separated sectors do we repair the
+         * minimum number of crossing edges by converting them to OPEN or PASSAGE.
+         *
+         * This keeps the visible result much closer to the requested equal
+         * distribution than forcing an entire spanning tree up front.
+         */
+        Set<Edge> repairedEdges = new HashSet<>();
 
-        Cell start = normalCells.get(random.nextInt(normalCells.size()));
-        visited.add(start);
-        stack.push(start);
+        while (true) {
+            Map<Cell, Integer> componentByCell =
+                traversableComponents(normalCells, edgeTypes);
 
-        while (!stack.isEmpty()) {
-            Cell current = stack.peek();
+            int componentCount = 0;
+            for (int component : componentByCell.values()) {
+                componentCount = Math.max(componentCount, component + 1);
+            }
 
-            List<Cell> options = new ArrayList<>();
-            for (Cell neighbour : neighbors(current)) {
-                if (cellSet.contains(neighbour) && !visited.contains(neighbour)) {
-                    options.add(neighbour);
+            if (componentCount <= 1) {
+                return repairedEdges;
+            }
+
+            List<Edge> crossingEdges = new ArrayList<>();
+
+            for (Edge edge : edgeTypes.keySet()) {
+                int firstComponent = componentByCell.get(edge.a);
+                int secondComponent = componentByCell.get(edge.b);
+
+                if (firstComponent != secondComponent) {
+                    crossingEdges.add(edge);
                 }
             }
 
-            Collections.shuffle(options, random);
+            if (crossingEdges.isEmpty()) {
+                throw new IllegalStateException(
+                    "Could not repair map connectivity although normal hexes should be connected."
+                );
+            }
 
-            if (options.isEmpty()) {
-                stack.pop();
+            Edge chosen = crossingEdges.get(random.nextInt(crossingEdges.size()));
+            edgeTypes.put(chosen, chooseTraversableEdgeType(random));
+            repairedEdges.add(chosen);
+        }
+    }
+
+    private Map<Cell, Integer> traversableComponents(
+        List<Cell> normalCells,
+        Map<Edge, EdgeType> edgeTypes
+    ) {
+        Map<Cell, List<Cell>> traversableNeighbours = new HashMap<>();
+
+        for (Cell cell : normalCells) {
+            traversableNeighbours.put(cell, new ArrayList<>());
+        }
+
+        for (Map.Entry<Edge, EdgeType> entry : edgeTypes.entrySet()) {
+            if (!isTraversable(entry.getValue())) {
                 continue;
             }
 
-            Cell neighbour = options.get(0);
-            visited.add(neighbour);
-            stack.push(neighbour);
-            tree.add(Edge.of(current, neighbour));
+            Edge edge = entry.getKey();
+            traversableNeighbours.get(edge.a).add(edge.b);
+            traversableNeighbours.get(edge.b).add(edge.a);
         }
 
-        if (visited.size() != cellSet.size()) {
-            throw new IllegalStateException("Remaining normal hex graph is unexpectedly disconnected.");
+        Map<Cell, Integer> componentByCell = new HashMap<>();
+        int nextComponent = 0;
+
+        for (Cell start : normalCells) {
+            if (componentByCell.containsKey(start)) {
+                continue;
+            }
+
+            Deque<Cell> stack = new ArrayDeque<>();
+            stack.push(start);
+            componentByCell.put(start, nextComponent);
+
+            while (!stack.isEmpty()) {
+                Cell current = stack.pop();
+
+                for (Cell neighbour : traversableNeighbours.get(current)) {
+                    if (!componentByCell.containsKey(neighbour)) {
+                        componentByCell.put(neighbour, nextComponent);
+                        stack.push(neighbour);
+                    }
+                }
+            }
+
+            nextComponent++;
         }
 
-        return tree;
+        return componentByCell;
+    }
+
+    private boolean isTraversable(EdgeType edgeType) {
+        return edgeType == EdgeType.OPEN || edgeType == EdgeType.PASSAGE;
     }
 
     private Set<Edge> uniqueEdges(List<Cell> cells) {
@@ -656,8 +721,7 @@ public class EvictMapPlugin extends Plugin {
     }
 
     private EdgeType chooseTraversableEdgeType(Random random) {
-        double openShare = OPEN_WEIGHT / (OPEN_WEIGHT + PASSAGE_WEIGHT);
-        return random.nextDouble() < openShare ? EdgeType.OPEN : EdgeType.PASSAGE;
+        return random.nextBoolean() ? EdgeType.OPEN : EdgeType.PASSAGE;
     }
 
     private EdgeType chooseEdgeType(Random random) {
