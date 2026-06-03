@@ -1,21 +1,25 @@
 package vini.evictmap;
 
+import arc.util.noise.Simplex;
 import mindustry.Vars;
 import mindustry.content.Blocks;
 import mindustry.world.Block;
 import mindustry.world.Tile;
 
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Random;
-import java.util.Set;
 
 /**
- * First visual test for Evict-style resource generation.
+ * Evict-style resource generator: global coherent noise fields.
  *
- * The values near the top are intentionally easy to tune after comparing a
- * few generated maps against experienced-player feedback.
+ * The first prototype grew a fixed number of blobs inside each individual
+ * room. That looked too artificial and made many rooms visibly poor.
+ *
+ * This version follows the same basic approach as Mindustry's editor Ore
+ * filter: evaluate coherent noise for each tile over the whole map, compare
+ * it against a threshold and paint matching tiles. Rooms only act as masks;
+ * they no longer generate isolated resource blobs independently.
  */
 final class ResourceGenerator {
 
@@ -26,472 +30,231 @@ final class ResourceGenerator {
     private static final long RESOURCE_SEED_XOR = 0x4f52452d45564943L;
 
     // ---------------------------------------------------------------------
-    // Safe placement areas
+    // Placement masks
     // ---------------------------------------------------------------------
 
     /**
-     * Liquids stay inside the stable room interior so they do not block the
-     * narrow connections between rooms.
+     * Ores may approach the wall edges and may cross visual room boundaries,
+     * but they are only placed on open Dark Sand floor.
      */
-    private static final int LIQUID_MAX_RADIUS = 30;
-    private static final int LIQUID_MAX_RADIUS_SQUARED =
-        LIQUID_MAX_RADIUS * LIQUID_MAX_RADIUS;
-
-    /**
-     * Keep liquids away from the centered Nucleus.
-     */
-    private static final int LIQUID_CORE_SAFE_RADIUS = 9;
-    private static final int LIQUID_CORE_SAFE_RADIUS_SQUARED =
-        LIQUID_CORE_SAFE_RADIUS * LIQUID_CORE_SAFE_RADIUS;
-
-    /**
-     * Ores may spread farther toward the room edge but not directly underneath
-     * the Nucleus footprint.
-     */
-    private static final int ORE_MAX_RADIUS = 36;
+    private static final int ORE_MAX_RADIUS = 39;
     private static final int ORE_MAX_RADIUS_SQUARED =
         ORE_MAX_RADIUS * ORE_MAX_RADIUS;
 
+    /**
+     * Do not place ore directly below the centered Nucleus footprint.
+     */
     private static final int ORE_CORE_SAFE_RADIUS = 4;
     private static final int ORE_CORE_SAFE_RADIUS_SQUARED =
         ORE_CORE_SAFE_RADIUS * ORE_CORE_SAFE_RADIUS;
 
-    // ---------------------------------------------------------------------
-    // Water test preset
-    // ---------------------------------------------------------------------
+    /**
+     * Water and tar stay away from narrow connections so they cannot block
+     * access between rooms. They remain inside the stable inner room area.
+     */
+    private static final int LIQUID_MAX_RADIUS = 31;
+    private static final int LIQUID_MAX_RADIUS_SQUARED =
+        LIQUID_MAX_RADIUS * LIQUID_MAX_RADIUS;
 
-    private static final int WATER_MIN_CLUSTERS = 2;
-    private static final double WATER_THIRD_CLUSTER_CHANCE = 0.58;
-    private static final double WATER_FOURTH_CLUSTER_CHANCE = 0.22;
-    private static final double WATER_FIFTH_CLUSTER_CHANCE = 0.07;
-
-    private static final double WATER_LARGE_CLUSTER_CHANCE = 0.15;
-    private static final int WATER_NORMAL_MIN_SIZE = 3;
-    private static final int WATER_NORMAL_MAX_SIZE = 8;
-    private static final int WATER_LARGE_MIN_SIZE = 12;
-    private static final int WATER_LARGE_MAX_SIZE = 14;
+    private static final int LIQUID_CORE_SAFE_RADIUS = 9;
+    private static final int LIQUID_CORE_SAFE_RADIUS_SQUARED =
+        LIQUID_CORE_SAFE_RADIUS * LIQUID_CORE_SAFE_RADIUS;
 
     // ---------------------------------------------------------------------
-    // Tar / oil test preset
+    // Global noise presets
     // ---------------------------------------------------------------------
 
     /**
-     * Oil is intentionally much rarer than water.
+     * Approximate first test values.
      *
-     * Resulting distribution:
-     * 0 clusters: 55%
-     * 1 cluster : 34%
-     * 2 clusters:  9%
-     * 3 clusters:  1.5%
-     * 4 clusters:  0.5%
+     * Scale controls average feature size.
+     * Threshold controls how much of the map survives.
+     * Octaves and falloff add the irregular smaller details visible in Evict.
+     *
+     * Ores use independent fields and are applied common -> rare so the rare
+     * ores may overwrite a few common tiles where fields overlap.
      */
-    private static final double TAR_ZERO_CLUSTER_THRESHOLD = 0.55;
-    private static final double TAR_ONE_CLUSTER_THRESHOLD = 0.89;
-    private static final double TAR_TWO_CLUSTER_THRESHOLD = 0.98;
-    private static final double TAR_THREE_CLUSTER_THRESHOLD = 0.995;
-
-    private static final double TAR_LARGE_CLUSTER_CHANCE = 0.14;
-    private static final int TAR_NORMAL_MIN_SIZE = 2;
-    private static final int TAR_NORMAL_MAX_SIZE = 5;
-    private static final int TAR_LARGE_MIN_SIZE = 6;
-    private static final int TAR_LARGE_MAX_SIZE = 9;
-
-    // ---------------------------------------------------------------------
-    // Ore test preset
-    // ---------------------------------------------------------------------
+    private static final NoisePreset[] ORE_PRESETS = new NoisePreset[]{
+        new NoisePreset(Blocks.oreCopper,   101, 22.5f, 0.785f, 2f, 0.30f,  0.00f),
+        new NoisePreset(Blocks.oreLead,     211, 22.0f, 0.795f, 2f, 0.30f,  0.00f),
+        new NoisePreset(Blocks.oreCoal,     307, 20.0f, 0.810f, 2f, 0.32f,  0.00f),
+        new NoisePreset(Blocks.oreTitanium, 401, 18.0f, 0.835f, 2f, 0.30f,  0.00f),
+        new NoisePreset(Blocks.oreThorium,  503, 18.5f, 0.842f, 2f, 0.30f,  0.00f)
+    };
 
     /**
-     * Order is rare -> common. This gives rarer ores a chance to claim space
-     * before common ores fill the remaining floor.
+     * Water should appear in most rooms, usually in several small patches.
+     * Tar/oil is intentionally rarer.
      */
-    private static final OrePreset[] ORE_PRESETS = new OrePreset[]{
-        new OrePreset(Blocks.oreThorium, 2, 5, 5, 16),
-        new OrePreset(Blocks.oreTitanium, 2, 5, 5, 17),
-        new OrePreset(Blocks.oreCoal, 3, 6, 7, 23),
-        new OrePreset(Blocks.oreLead, 4, 7, 8, 28),
-        new OrePreset(Blocks.oreCopper, 5, 8, 10, 32)
-    };
+    private static final NoisePreset WATER_PRESET =
+        new NoisePreset(Blocks.darksandWater, 701, 12.0f, 0.815f, 2f, 0.38f, 0.00f);
 
-    private static final int[][] DIRECTIONS = new int[][]{
-        {-1, -1}, {0, -1}, {1, -1},
-        {-1,  0},          {1,  0},
-        {-1,  1}, {0,  1}, {1,  1}
-    };
+    private static final NoisePreset TAR_PRESET =
+        new NoisePreset(Blocks.tar, 809, 10.0f, 0.875f, 2f, 0.35f, 0.00f);
 
     private ResourceGenerator() {
     }
 
     static Summary generate(long mapSeed, List<HexCenter> centers) {
-        Random random = new Random(mapSeed ^ RESOURCE_SEED_XOR);
+        int seed = foldSeed(mapSeed ^ RESOURCE_SEED_XOR);
         MutableSummary summary = new MutableSummary();
 
         /**
          * Floors first, overlays second:
          * - water and tar replace Dark Sand floor
-         * - ores are then placed only on remaining Dark Sand
+         * - ore is placed afterward only where a surface still exists
          */
-        for (HexCenter center : centers) {
-            generateWater(random, center, summary);
-            generateTar(random, center, summary);
-        }
+        generateFloorNoise(seed, centers, WATER_PRESET, summary, true);
+        generateFloorNoise(seed, centers, TAR_PRESET, summary, false);
 
-        for (HexCenter center : centers) {
-            generateOres(random, center, summary);
+        for (NoisePreset preset : ORE_PRESETS) {
+            generateOreNoise(seed, centers, preset, summary);
         }
 
         return summary.freeze();
     }
 
     static String presetDescription() {
-        return "test preset: ores + 2-5 water clusters per normal hex + rare 0-4 tar clusters";
+        return "global coherent-noise test preset for ores, water and tar";
     }
 
-    private static void generateWater(
-        Random random,
-        HexCenter center,
+    private static void generateFloorNoise(
+        int seed,
+        List<HexCenter> centers,
+        NoisePreset preset,
+        MutableSummary summary,
+        boolean water
+    ) {
+        int width = Vars.world.width();
+        int height = Vars.world.height();
+
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                Tile tile = Vars.world.tile(x, y);
+
+                if (
+                    tile == null
+                        || tile.block() != Blocks.air
+                        || tile.floor() != Blocks.darksand
+                        || !insideLiquidMask(x, y, centers)
+                ) {
+                    continue;
+                }
+
+                if (sample(seed, preset, x, y) > preset.threshold) {
+                    Tile.setFloor(tile, preset.block, Blocks.air);
+
+                    if (water) {
+                        summary.waterTiles++;
+                    } else {
+                        summary.tarTiles++;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void generateOreNoise(
+        int seed,
+        List<HexCenter> centers,
+        NoisePreset preset,
         MutableSummary summary
     ) {
-        int clusterCount = WATER_MIN_CLUSTERS;
+        int width = Vars.world.width();
+        int height = Vars.world.height();
 
-        if (random.nextDouble() < WATER_THIRD_CLUSTER_CHANCE) {
-            clusterCount++;
-        }
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                Tile tile = Vars.world.tile(x, y);
 
-        if (random.nextDouble() < WATER_FOURTH_CLUSTER_CHANCE) {
-            clusterCount++;
-        }
+                if (
+                    tile == null
+                        || tile.block() != Blocks.air
+                        || tile.floor() != Blocks.darksand
+                        || !insideOreMask(x, y, centers)
+                ) {
+                    continue;
+                }
 
-        if (random.nextDouble() < WATER_FIFTH_CLUSTER_CHANCE) {
-            clusterCount++;
-        }
-
-        for (int cluster = 0; cluster < clusterCount; cluster++) {
-            int targetSize = random.nextDouble() < WATER_LARGE_CLUSTER_CHANCE
-                ? inclusiveRandom(random, WATER_LARGE_MIN_SIZE, WATER_LARGE_MAX_SIZE)
-                : inclusiveRandom(random, WATER_NORMAL_MIN_SIZE, WATER_NORMAL_MAX_SIZE);
-
-            int placed = placeFloorCluster(
-                random,
-                center,
-                Blocks.darksandWater,
-                targetSize
-            );
-
-            summary.waterClusters++;
-            summary.waterTiles += placed;
-        }
-    }
-
-    private static void generateTar(
-        Random random,
-        HexCenter center,
-        MutableSummary summary
-    ) {
-        int clusterCount = chooseTarClusterCount(random);
-
-        for (int cluster = 0; cluster < clusterCount; cluster++) {
-            int targetSize = random.nextDouble() < TAR_LARGE_CLUSTER_CHANCE
-                ? inclusiveRandom(random, TAR_LARGE_MIN_SIZE, TAR_LARGE_MAX_SIZE)
-                : inclusiveRandom(random, TAR_NORMAL_MIN_SIZE, TAR_NORMAL_MAX_SIZE);
-
-            int placed = placeFloorCluster(
-                random,
-                center,
-                Blocks.tar,
-                targetSize
-            );
-
-            summary.tarClusters++;
-            summary.tarTiles += placed;
-        }
-    }
-
-    private static int chooseTarClusterCount(Random random) {
-        double value = random.nextDouble();
-
-        if (value < TAR_ZERO_CLUSTER_THRESHOLD) {
-            return 0;
-        }
-
-        if (value < TAR_ONE_CLUSTER_THRESHOLD) {
-            return 1;
-        }
-
-        if (value < TAR_TWO_CLUSTER_THRESHOLD) {
-            return 2;
-        }
-
-        if (value < TAR_THREE_CLUSTER_THRESHOLD) {
-            return 3;
-        }
-
-        return 4;
-    }
-
-    private static void generateOres(
-        Random random,
-        HexCenter center,
-        MutableSummary summary
-    ) {
-        for (OrePreset preset : ORE_PRESETS) {
-            int clusterCount = inclusiveRandom(
-                random,
-                preset.minimumClusters,
-                preset.maximumClusters
-            );
-
-            for (int cluster = 0; cluster < clusterCount; cluster++) {
-                int targetSize = inclusiveRandom(
-                    random,
-                    preset.minimumSize,
-                    preset.maximumSize
-                );
-
-                int placed = placeOreCluster(
-                    random,
-                    center,
-                    preset.overlay,
-                    targetSize
-                );
-
-                summary.addOre(preset.overlay, placed);
+                if (sample(seed, preset, x, y) > preset.threshold) {
+                    tile.setOverlay(preset.block);
+                    summary.addOre(preset.block);
+                }
             }
         }
     }
 
-    private static int placeFloorCluster(
-        Random random,
-        HexCenter center,
-        Block targetFloor,
-        int targetSize
+    private static boolean insideOreMask(
+        int x,
+        int y,
+        List<HexCenter> centers
     ) {
-        TilePoint start = findFloorStart(random, center, targetFloor);
+        int closestDistanceSquared = closestCenterDistanceSquared(x, y, centers);
 
-        if (start == null) {
-            return 0;
-        }
+        return closestDistanceSquared >= ORE_CORE_SAFE_RADIUS_SQUARED
+            && closestDistanceSquared <= ORE_MAX_RADIUS_SQUARED;
+    }
 
-        Set<TilePoint> placed = new LinkedHashSet<>();
-        placed.add(start);
-        applyFloor(start, targetFloor);
+    private static boolean insideLiquidMask(
+        int x,
+        int y,
+        List<HexCenter> centers
+    ) {
+        int closestDistanceSquared = closestCenterDistanceSquared(x, y, centers);
 
-        int attempts = 0;
-        int maximumAttempts = Math.max(80, targetSize * 35);
+        return closestDistanceSquared >= LIQUID_CORE_SAFE_RADIUS_SQUARED
+            && closestDistanceSquared <= LIQUID_MAX_RADIUS_SQUARED;
+    }
 
-        while (placed.size() < targetSize && attempts++ < maximumAttempts) {
-            TilePoint anchor = randomElement(random, placed);
-            int[] direction = DIRECTIONS[random.nextInt(DIRECTIONS.length)];
+    private static int closestCenterDistanceSquared(
+        int x,
+        int y,
+        List<HexCenter> centers
+    ) {
+        int closest = Integer.MAX_VALUE;
 
-            TilePoint candidate = new TilePoint(
-                anchor.x + direction[0],
-                anchor.y + direction[1]
-            );
+        for (HexCenter center : centers) {
+            int deltaX = x - center.x;
+            int deltaY = y - center.y;
+            int distanceSquared = deltaX * deltaX + deltaY * deltaY;
 
-            if (
-                !placed.contains(candidate)
-                    && canPlaceLiquidFloor(candidate, center, targetFloor)
-            ) {
-                placed.add(candidate);
-                applyFloor(candidate, targetFloor);
+            if (distanceSquared < closest) {
+                closest = distanceSquared;
             }
         }
 
-        return placed.size();
+        return closest;
     }
 
-    private static int placeOreCluster(
-        Random random,
-        HexCenter center,
-        Block oreOverlay,
-        int targetSize
+    private static float sample(
+        int baseSeed,
+        NoisePreset preset,
+        int x,
+        int y
     ) {
-        TilePoint start = findOreStart(random, center);
-
-        if (start == null) {
-            return 0;
-        }
-
-        Set<TilePoint> placed = new LinkedHashSet<>();
-        placed.add(start);
-        applyOre(start, oreOverlay);
-
-        int attempts = 0;
-        int maximumAttempts = Math.max(100, targetSize * 40);
-
-        while (placed.size() < targetSize && attempts++ < maximumAttempts) {
-            TilePoint anchor = randomElement(random, placed);
-            int[] direction = DIRECTIONS[random.nextInt(DIRECTIONS.length)];
-
-            TilePoint candidate = new TilePoint(
-                anchor.x + direction[0],
-                anchor.y + direction[1]
-            );
-
-            if (
-                !placed.contains(candidate)
-                    && canPlaceOre(candidate, center)
-            ) {
-                placed.add(candidate);
-                applyOre(candidate, oreOverlay);
-            }
-        }
-
-        return placed.size();
-    }
-
-    private static TilePoint findFloorStart(
-        Random random,
-        HexCenter center,
-        Block targetFloor
-    ) {
-        for (int attempt = 0; attempt < 160; attempt++) {
-            TilePoint candidate = randomPointInRadius(
-                random,
-                center,
-                LIQUID_MAX_RADIUS
-            );
-
-            if (canPlaceLiquidFloor(candidate, center, targetFloor)) {
-                return candidate;
-            }
-        }
-
-        return null;
-    }
-
-    private static TilePoint findOreStart(Random random, HexCenter center) {
-        for (int attempt = 0; attempt < 220; attempt++) {
-            TilePoint candidate = randomPointInRadius(
-                random,
-                center,
-                ORE_MAX_RADIUS
-            );
-
-            if (canPlaceOre(candidate, center)) {
-                return candidate;
-            }
-        }
-
-        return null;
-    }
-
-    private static TilePoint randomPointInRadius(
-        Random random,
-        HexCenter center,
-        int radius
-    ) {
-        int x;
-        int y;
-
-        do {
-            x = center.x + random.nextInt(radius * 2 + 1) - radius;
-            y = center.y + random.nextInt(radius * 2 + 1) - radius;
-        } while (squaredDistance(x, y, center.x, center.y) > radius * radius);
-
-        return new TilePoint(x, y);
-    }
-
-    private static boolean canPlaceLiquidFloor(
-        TilePoint point,
-        HexCenter center,
-        Block targetFloor
-    ) {
-        Tile tile = Vars.world.tile(point.x, point.y);
-
-        if (tile == null || tile.block() != Blocks.air) {
-            return false;
-        }
-
-        int distanceSquared = squaredDistance(
-            point.x,
-            point.y,
-            center.x,
-            center.y
+        /**
+         * Mirrors Mindustry's editor OreFilter approach:
+         * noise(x, y + x * tilt, scale, 1, octaves, falloff)
+         */
+        return Simplex.noise2d(
+            baseSeed + preset.seedOffset,
+            preset.octaves,
+            preset.falloff,
+            1f / preset.scale,
+            x + 10f,
+            y + x * preset.tilt + 10f
         );
-
-        if (
-            distanceSquared < LIQUID_CORE_SAFE_RADIUS_SQUARED
-                || distanceSquared > LIQUID_MAX_RADIUS_SQUARED
-        ) {
-            return false;
-        }
-
-        return tile.floor() == Blocks.darksand || tile.floor() == targetFloor;
     }
 
-    private static boolean canPlaceOre(TilePoint point, HexCenter center) {
-        Tile tile = Vars.world.tile(point.x, point.y);
-
-        if (
-            tile == null
-                || tile.block() != Blocks.air
-                || tile.floor() != Blocks.darksand
-                || tile.overlay() != Blocks.air
-        ) {
-            return false;
-        }
-
-        int distanceSquared = squaredDistance(
-            point.x,
-            point.y,
-            center.x,
-            center.y
-        );
-
-        return distanceSquared >= ORE_CORE_SAFE_RADIUS_SQUARED
-            && distanceSquared <= ORE_MAX_RADIUS_SQUARED;
-    }
-
-    private static void applyFloor(TilePoint point, Block floor) {
-        Tile tile = Vars.world.tile(point.x, point.y);
-
-        if (tile != null) {
-            Tile.setFloor(tile, floor, Blocks.air);
-        }
-    }
-
-    private static void applyOre(TilePoint point, Block oreOverlay) {
-        Tile tile = Vars.world.tile(point.x, point.y);
-
-        if (tile != null) {
-            tile.setOverlay(oreOverlay);
-        }
-    }
-
-    private static TilePoint randomElement(
-        Random random,
-        Set<TilePoint> points
-    ) {
-        int targetIndex = random.nextInt(points.size());
-        int index = 0;
-
-        for (TilePoint point : points) {
-            if (index++ == targetIndex) {
-                return point;
-            }
-        }
-
-        throw new IllegalStateException("Could not select random cluster tile.");
-    }
-
-    private static int inclusiveRandom(Random random, int minimum, int maximum) {
-        return minimum + random.nextInt(maximum - minimum + 1);
-    }
-
-    private static int squaredDistance(int x1, int y1, int x2, int y2) {
-        int deltaX = x1 - x2;
-        int deltaY = y1 - y2;
-
-        return deltaX * deltaX + deltaY * deltaY;
+    private static int foldSeed(long seed) {
+        return (int)(seed ^ (seed >>> 32));
     }
 
     record HexCenter(int x, int y) {
     }
 
     record Summary(
-        int waterClusters,
         int waterTiles,
-        int tarClusters,
         int tarTiles,
         int copperTiles,
         int leadTiles,
@@ -500,8 +263,8 @@ final class ResourceGenerator {
         int thoriumTiles
     ) {
         String compact() {
-            return "water=" + waterClusters + "/" + waterTiles
-                + ", tar=" + tarClusters + "/" + tarTiles
+            return "water=" + waterTiles
+                + ", tar=" + tarTiles
                 + ", copper=" + copperTiles
                 + ", lead=" + leadTiles
                 + ", coal=" + coalTiles
@@ -510,22 +273,19 @@ final class ResourceGenerator {
         }
     }
 
-    private record TilePoint(int x, int y) {
-    }
-
-    private record OrePreset(
-        Block overlay,
-        int minimumClusters,
-        int maximumClusters,
-        int minimumSize,
-        int maximumSize
+    private record NoisePreset(
+        Block block,
+        int seedOffset,
+        float scale,
+        float threshold,
+        float octaves,
+        float falloff,
+        float tilt
     ) {
     }
 
     private static final class MutableSummary {
-        private int waterClusters;
         private int waterTiles;
-        private int tarClusters;
         private int tarTiles;
         private int copperTiles;
         private int leadTiles;
@@ -533,25 +293,23 @@ final class ResourceGenerator {
         private int titaniumTiles;
         private int thoriumTiles;
 
-        private void addOre(Block overlay, int amount) {
+        private void addOre(Block overlay) {
             if (overlay == Blocks.oreCopper) {
-                copperTiles += amount;
+                copperTiles++;
             } else if (overlay == Blocks.oreLead) {
-                leadTiles += amount;
+                leadTiles++;
             } else if (overlay == Blocks.oreCoal) {
-                coalTiles += amount;
+                coalTiles++;
             } else if (overlay == Blocks.oreTitanium) {
-                titaniumTiles += amount;
+                titaniumTiles++;
             } else if (overlay == Blocks.oreThorium) {
-                thoriumTiles += amount;
+                thoriumTiles++;
             }
         }
 
         private Summary freeze() {
             return new Summary(
-                waterClusters,
                 waterTiles,
-                tarClusters,
                 tarTiles,
                 copperTiles,
                 leadTiles,
