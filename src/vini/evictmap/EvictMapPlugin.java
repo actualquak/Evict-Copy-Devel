@@ -145,7 +145,7 @@ public class EvictMapPlugin extends Plugin {
             }
         });
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.3.0. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.3.1. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -342,7 +342,14 @@ public class EvictMapPlugin extends Plugin {
 
             for (int y = minY; y <= maxY; y++) {
                 for (int x = minX; x <= maxX; x++) {
-                    if (pointInsideTranslatedInnerPolygon(x, y, center)) {
+                    // Red zone is hard-locked:
+                    // tiles outside every outer circle stay Dirt Wall forever.
+                    // The inner polygon may only turn a tile into guaranteed
+                    // floor when that tile was already reached by a circle.
+                    if (
+                        zones[y][x] != 0
+                            && pointInsideTranslatedInnerPolygon(x, y, center)
+                    ) {
                         zones[y][x] = 2;
                     }
                 }
