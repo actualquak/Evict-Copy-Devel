@@ -144,12 +144,21 @@ public class EvictMapPlugin extends Plugin {
     private Long nextSeed = null;
     private Long lastSeed = null;
 
+    /**
+     * After runtime terrain generation, Mindustry's ore and pathfinding
+     * indexes still describe the originally loaded blank map. We deliberately
+     * fire a second WorldLoadEvent after generation so vanilla systems rebuild
+     * those indexes. This guard prevents that event from generating a second
+     * map recursively.
+     */
+    private boolean refreshingWorldIndexes = false;
+
     private final TeamManager teamManager = new TeamManager();
 
     @Override
     public void init() {
         Events.on(WorldLoadEvent.class, event -> {
-            if (!autoGenerate) {
+            if (!autoGenerate || refreshingWorldIndexes) {
                 return;
             }
 
@@ -179,7 +188,7 @@ public class EvictMapPlugin extends Plugin {
 
         Events.on(PlayerJoin.class, event -> teamManager.handlePlayerJoin(event.player));
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.6.0. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.6.1. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -351,6 +360,8 @@ public class EvictMapPlugin extends Plugin {
 
         placeNucleusCores(centers, normalCells);
 
+        refreshWorldIndexes();
+
         teamManager.beginRound(
             startHexSlots(centers, normalCells, filledCells),
             seed
@@ -369,6 +380,30 @@ public class EvictMapPlugin extends Plugin {
             resourceSummary.compact(),
             teamManager.compactStatus()
         );
+    }
+
+    private void refreshWorldIndexes() {
+        /**
+         * The blank base map has already emitted its normal WorldLoadEvent
+         * before this plugin replaces floors, overlays, walls and cores.
+         *
+         * Vanilla systems such as BlockIndexer and Pathfinder listen for that
+         * event to build their caches. Fire the event once more after the
+         * finished Evict world exists so Monos mine the real ore tiles and
+         * pathfinding sees the generated walls.
+         *
+         * Mindustry's own BlockIndexer explicitly supports duplicate
+         * WorldLoadEvents, so this uses the same normal rebuild path instead
+         * of modifying internal cache fields directly.
+         */
+        refreshingWorldIndexes = true;
+
+        try {
+            Events.fire(new WorldLoadEvent());
+            Log.info("[EvictMapGenerator] Rebuilt vanilla world indexes after runtime terrain generation.");
+        } finally {
+            refreshingWorldIndexes = false;
+        }
     }
 
     private void applyEvictRules() {
