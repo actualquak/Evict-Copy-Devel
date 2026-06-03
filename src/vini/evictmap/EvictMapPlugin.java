@@ -5,6 +5,7 @@ import arc.util.CommandHandler;
 import arc.util.Log;
 import mindustry.Vars;
 import mindustry.content.Blocks;
+import mindustry.game.EventType.CoreChangeEvent;
 import mindustry.game.EventType.PlayEvent;
 import mindustry.game.EventType.PlayerJoin;
 import mindustry.game.EventType.WorldLoadEvent;
@@ -45,9 +46,12 @@ import java.util.Set;
  * - reconnect to the same personal team during the current round
  * - one-time starting items and starting schematic on personal-core claim
  *
+ * - delayed Core Shard capture after a core is destroyed
+ * - captured-hex building wipe before the new Core Shard appears
+ *
  * Deliberately not included yet:
- * - core capture and elimination
- * - automatic round reset
+ * - elimination announcements
+ * - victory detection and automatic round reset
  * - final resource balancing
  */
 public class EvictMapPlugin extends Plugin {
@@ -187,8 +191,9 @@ public class EvictMapPlugin extends Plugin {
         });
 
         Events.on(PlayerJoin.class, event -> teamManager.handlePlayerJoin(event.player));
+        Events.on(CoreChangeEvent.class, event -> teamManager.handleCoreChange(event.core));
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.6.1. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.7.1. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
