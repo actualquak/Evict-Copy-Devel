@@ -1,10 +1,12 @@
 package vini.evictmap;
 
+import arc.func.Cons;
 import arc.util.Log;
 import arc.util.Time;
 import mindustry.Vars;
 import mindustry.content.Blocks;
 import mindustry.game.Team;
+import mindustry.gen.Call;
 import mindustry.gen.Groups;
 import mindustry.gen.Player;
 import mindustry.world.Tile;
@@ -38,14 +40,15 @@ import java.util.Set;
  * - the Evict start schematic, anchored to the centered Nucleus
  *
  * Implemented in the current phase:
- * - destroyed registered cores leave an empty hex center for seven seconds
+ * - destroyed registered cores leave an empty hex center for five seconds
  * - every synthetic building in the captured hex is removed
  * - the attacker receives a centered 3x3 Core Shard without bonus items
  * - existing attacker resources remain untouched because Mindustry cores
  *   intentionally share one team inventory
- *
- * Not implemented yet:
- * - elimination announcements and round victory
+ * - personal-team elimination messages
+ * - victory detection after all capture delays have finished
+ * - Fallen can win only after at least one personal start core was assigned
+ * - one guarded automatic random-seed round reset
  */
 final class TeamManager {
 
@@ -73,7 +76,7 @@ final class TeamManager {
      * Captures intentionally do not complete instantly. The empty center is
      * visible for a few seconds before the attacker's small Core Shard appears.
      */
-    private static final float CAPTURE_DELAY_TICKS = 7f * 60f;
+    private static final float CAPTURE_DELAY_TICKS = 5f * 60f;
 
     /**
      * Capture cleanup follows the real Evict core range exactly.
@@ -88,18 +91,30 @@ final class TeamManager {
 
     private final List<HexSlot> slots = new ArrayList<>();
     private final Map<String, Integer> teamIdByPlayerUuid = new HashMap<>();
+    private final Map<Integer, String> playerNameByTeamId = new HashMap<>();
     private final Set<Integer> usedPersonalTeamIds = new HashSet<>();
+    private final Set<Integer> eliminatedTeamIds = new HashSet<>();
+
+    private final Cons<Team> victoryHandler;
 
     private Random random = new Random();
     private boolean roundActive = false;
+    private boolean roundActivated = false;
+    private boolean resetting = false;
     private long roundSerial = 0L;
+
+    TeamManager(Cons<Team> victoryHandler) {
+        this.victoryHandler = victoryHandler;
+    }
 
     void beginRound(List<HexSlot> newSlots, long seed) {
         slots.clear();
         slots.addAll(newSlots);
 
         teamIdByPlayerUuid.clear();
+        playerNameByTeamId.clear();
         usedPersonalTeamIds.clear();
+        eliminatedTeamIds.clear();
 
         for (HexSlot slot : slots) {
             slot.ownerTeamId = FALLEN_TEAM_ID;
@@ -109,6 +124,8 @@ final class TeamManager {
 
         random = new Random(seed ^ TEAM_RANDOM_XOR);
         roundSerial++;
+        roundActivated = false;
+        resetting = false;
         roundActive = true;
 
         Log.info(
@@ -130,7 +147,7 @@ final class TeamManager {
     }
 
     void handlePlayerJoin(Player player) {
-        if (!roundActive || player == null) {
+        if (!roundActive || resetting || player == null) {
             return;
         }
 
@@ -138,6 +155,10 @@ final class TeamManager {
         Integer existingTeamId = teamIdByPlayerUuid.get(uuid);
 
         if (existingTeamId != null) {
+            if (existingTeamId != FALLEN_TEAM_ID) {
+                playerNameByTeamId.put(existingTeamId, player.plainName());
+            }
+
             assignPlayerToTeam(player, Team.get(existingTeamId));
 
             if (existingTeamId == FALLEN_TEAM_ID) {
@@ -182,6 +203,8 @@ final class TeamManager {
         claimCore(startHex, personalTeam);
         usedPersonalTeamIds.add(teamId);
         teamIdByPlayerUuid.put(uuid, teamId);
+        playerNameByTeamId.put(teamId, player.plainName());
+        roundActivated = true;
 
         assignPlayerToTeam(player, personalTeam);
 
@@ -236,7 +259,9 @@ final class TeamManager {
             + ", neutralHexes=" + neutral
             + ", claimedHexes=" + claimed
             + ", capturingHexes=" + capturing
-            + ", rememberedPlayers=" + teamIdByPlayerUuid.size();
+            + ", rememberedPlayers=" + teamIdByPlayerUuid.size()
+            + ", roundActivated=" + roundActivated
+            + ", resetting=" + resetting;
     }
 
     private HexSlot chooseSafeStartHex() {
@@ -339,6 +364,7 @@ final class TeamManager {
     void handleCoreChange(CoreBuild core) {
         if (
             !roundActive
+                || resetting
                 || core == null
                 || core.health > 0f
                 || core.tile == null
@@ -361,7 +387,7 @@ final class TeamManager {
         long scheduledRoundSerial = roundSerial;
 
         Log.info(
-            "[EvictMapGenerator] Core destroyed at hex (@,@). defender=#@ attacker=#@. Clearing buildings and placing a Core Shard in 7 seconds.",
+            "[EvictMapGenerator] Core destroyed at hex (@,@). defender=#@ attacker=#@. Clearing buildings and placing a Core Shard in 5 seconds.",
             slot.col,
             slot.row,
             defenderTeam.id,
@@ -392,6 +418,7 @@ final class TeamManager {
     ) {
         if (
             !roundActive
+                || resetting
                 || scheduledRoundSerial != roundSerial
                 || !slot.capturing
         ) {
@@ -401,7 +428,7 @@ final class TeamManager {
         int removedBuildings = clearSyntheticBuildingsInsideHex(slot);
 
         Log.info(
-            "[EvictMapGenerator] Cleared @ synthetic buildings from captured hex (@,@). Waiting 7 seconds for team #@ Core Shard.",
+            "[EvictMapGenerator] Cleared @ synthetic buildings from captured hex (@,@). Waiting 5 seconds for team #@ Core Shard.",
             removedBuildings,
             slot.col,
             slot.row,
@@ -427,6 +454,7 @@ final class TeamManager {
     ) {
         if (
             !roundActive
+                || resetting
                 || scheduledRoundSerial != roundSerial
                 || !slot.capturing
         ) {
@@ -448,7 +476,7 @@ final class TeamManager {
         /**
          * The center should already be empty. Clear any unexpected synthetic
          * block that appeared during the delay and place the attacker's small
-         * 3x3 Core Shard with an empty inventory.
+         * 3x3 Core Shard without adding any bonus items.
          */
         if (centerTile.synthetic()) {
             centerTile.removeNet();
@@ -471,12 +499,127 @@ final class TeamManager {
         slot.capturing = false;
 
         Log.info(
-            "[EvictMapGenerator] Capture complete at hex (@,@): team #@ -> team #@ with an empty Core Shard.",
+            "[EvictMapGenerator] Capture complete at hex (@,@): team #@ -> team #@ with a Core Shard and no bonus items.",
             slot.col,
             slot.row,
             defenderTeam.id,
             attackerTeam.id
         );
+
+        if (attackerTeam != defenderTeam) {
+            announceEliminationIfNeeded(defenderTeam, attackerTeam);
+        }
+
+        checkVictory();
+    }
+
+    private void announceEliminationIfNeeded(
+        Team defenderTeam,
+        Team attackerTeam
+    ) {
+        if (
+            defenderTeam == FALLEN_TEAM
+                || defenderTeam == attackerTeam
+                || eliminatedTeamIds.contains(defenderTeam.id)
+                || ownsAnyHex(defenderTeam.id)
+        ) {
+            return;
+        }
+
+        eliminatedTeamIds.add(defenderTeam.id);
+
+        String message =
+            "[accent]"
+                + displayTeam(defenderTeam)
+                + "[] has been eliminated by [scarlet]"
+                + displayTeam(attackerTeam)
+                + "[].";
+
+        Call.sendMessage(message);
+
+        Log.info(
+            "[EvictMapGenerator] Elimination: @ was eliminated by @.",
+            displayTeam(defenderTeam),
+            displayTeam(attackerTeam)
+        );
+    }
+
+    private boolean ownsAnyHex(int teamId) {
+        for (HexSlot slot : slots) {
+            if (effectiveOwnerTeamId(slot) == teamId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void checkVictory() {
+        if (
+            !roundActive
+                || resetting
+                || slots.isEmpty()
+        ) {
+            return;
+        }
+
+        /**
+         * Do not finish a round while another captured core is still waiting
+         * for its Core Shard. This guarantees that the final visible capture
+         * completes before the normal post-game transition begins.
+         */
+        for (HexSlot slot : slots) {
+            if (slot.capturing) {
+                return;
+            }
+        }
+
+        int winnerTeamId = slots.get(0).ownerTeamId;
+
+        for (HexSlot slot : slots) {
+            if (slot.ownerTeamId != winnerTeamId) {
+                return;
+            }
+        }
+
+        /**
+         * Fallen owns every neutral core immediately after generation. It may
+         * win only after the round has actually started through at least one
+         * personal start-core assignment.
+         */
+        if (winnerTeamId == FALLEN_TEAM_ID && !roundActivated) {
+            return;
+        }
+
+        Team winner = Team.get(winnerTeamId);
+
+        resetting = true;
+        roundActive = false;
+
+        Call.sendMessage(
+            "[accent]"
+                + displayTeam(winner)
+                + "[] has conquered every hex and won the round."
+        );
+
+        Log.info(
+            "[EvictMapGenerator] Victory: @ owns every hex. Starting guarded post-game reset.",
+            displayTeam(winner)
+        );
+
+        victoryHandler.get(winner);
+    }
+
+    private String displayTeam(Team team) {
+        if (team == FALLEN_TEAM) {
+            return "Fallen";
+        }
+
+        String playerName = playerNameByTeamId.get(team.id);
+
+        return playerName == null || playerName.isBlank()
+            ? "Team #" + team.id
+            : playerName;
     }
 
     private Team validCaptureAttacker(Team lastDamage, Team defenderTeam) {

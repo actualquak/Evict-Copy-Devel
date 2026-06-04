@@ -6,6 +6,7 @@ import arc.util.Log;
 import mindustry.Vars;
 import mindustry.content.Blocks;
 import mindustry.game.EventType.CoreChangeEvent;
+import mindustry.game.EventType.GameOverEvent;
 import mindustry.game.EventType.PlayEvent;
 import mindustry.game.EventType.PlayerJoin;
 import mindustry.game.EventType.WorldLoadEvent;
@@ -49,9 +50,12 @@ import java.util.Set;
  * - delayed Core Shard capture after a core is destroyed
  * - captured-hex building wipe before the new Core Shard appears
  *
- * Deliberately not included yet:
  * - elimination announcements
- * - victory detection and automatic round reset
+ * - custom victory detection
+ * - automatic random-seed round reset through the dedicated server's
+ *   normal post-game transition
+ *
+ * Deliberately not included yet:
  * - final resource balancing
  */
 public class EvictMapPlugin extends Plugin {
@@ -157,7 +161,7 @@ public class EvictMapPlugin extends Plugin {
      */
     private boolean refreshingWorldIndexes = false;
 
-    private final TeamManager teamManager = new TeamManager();
+    private final TeamManager teamManager = new TeamManager(this::handleRoundVictory);
 
     @Override
     public void init() {
@@ -193,7 +197,7 @@ public class EvictMapPlugin extends Plugin {
         Events.on(PlayerJoin.class, event -> teamManager.handlePlayerJoin(event.player));
         Events.on(CoreChangeEvent.class, event -> teamManager.handleCoreChange(event.core));
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.7.2. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.8.0. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -385,6 +389,25 @@ public class EvictMapPlugin extends Plugin {
             resourceSummary.compact(),
             teamManager.compactStatus()
         );
+    }
+
+    private void handleRoundVictory(Team winner) {
+        /**
+         * Reuse the dedicated server's normal GameOverEvent transition.
+         *
+         * ServerControl will announce the selected next map, wait its normal
+         * post-game delay and load a fresh base map. WorldLoadEvent then runs
+         * this generator again and consumes the random seed prepared here.
+         */
+        nextSeed = randomSeed();
+
+        Log.info(
+            "[EvictMapGenerator] Round winner: team #@. Prepared random seed @ for the next generated round.",
+            winner.id,
+            nextSeed
+        );
+
+        Events.fire(new GameOverEvent(winner));
     }
 
     private void refreshWorldIndexes() {
