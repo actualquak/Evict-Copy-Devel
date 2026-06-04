@@ -162,6 +162,18 @@ public class EvictMapPlugin extends Plugin {
      */
     private boolean refreshingWorldIndexes = false;
 
+    /**
+     * Connected players can temporarily disappear from Groups.player while a
+     * dedicated server transitions into the next map. A single next-tick
+     * retry was not sufficient on real round resets, so scan repeatedly for a
+     * short bounded period after every PlayEvent.
+     */
+    private static final float CONNECTED_PLAYER_SCAN_INITIAL_DELAY_TICKS = 1f;
+    private static final float CONNECTED_PLAYER_SCAN_INTERVAL_TICKS = 15f;
+    private static final int CONNECTED_PLAYER_SCAN_ATTEMPTS = 120;
+
+    private long connectedPlayerScanSerial = 0L;
+
     private final TeamManager teamManager = new TeamManager(this::handleRoundVictory);
 
     @Override
@@ -195,13 +207,12 @@ public class EvictMapPlugin extends Plugin {
 
             /**
              * During an automatic post-game map reload, connected players are
-             * temporarily absent while WorldLoadEvent generates the new map.
-             * They become available again once PlayEvent finishes.
-             *
-             * Re-check one tick later so players who stayed connected receive
-             * a fresh start core for the new round without having to reconnect.
+             * temporarily absent from Groups.player. On a real server they may
+             * still be missing one tick after PlayEvent, so keep checking for a
+             * bounded period. TeamManager safely ignores players already
+             * assigned during this round.
              */
-            Time.run(1f, teamManager::assignConnectedPlayers);
+            scheduleConnectedPlayerAssignmentScan();
 
             Log.info("[EvictMapGenerator] Re-applied Evict rules after host-mode initialization.");
         });
@@ -209,7 +220,7 @@ public class EvictMapPlugin extends Plugin {
         Events.on(PlayerJoin.class, event -> teamManager.handlePlayerJoin(event.player));
         Events.on(CoreChangeEvent.class, event -> teamManager.handleCoreChange(event.core));
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.8.2. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.8.3. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -400,6 +411,49 @@ public class EvictMapPlugin extends Plugin {
             repairedConnectivityEdges.size(),
             resourceSummary.compact(),
             teamManager.compactStatus()
+        );
+    }
+
+    private void scheduleConnectedPlayerAssignmentScan() {
+        long scanSerial = ++connectedPlayerScanSerial;
+
+        scheduleConnectedPlayerAssignmentScan(
+            scanSerial,
+            CONNECTED_PLAYER_SCAN_ATTEMPTS,
+            CONNECTED_PLAYER_SCAN_INITIAL_DELAY_TICKS
+        );
+
+        Log.info(
+            "[EvictMapGenerator] Scheduled connected-player start assignment scan for up to 30 seconds."
+        );
+    }
+
+    private void scheduleConnectedPlayerAssignmentScan(
+        long scanSerial,
+        int attemptsRemaining,
+        float delayTicks
+    ) {
+        Time.run(
+            delayTicks,
+            () -> {
+                if (
+                    !autoGenerate
+                        || scanSerial != connectedPlayerScanSerial
+                        || attemptsRemaining <= 0
+                ) {
+                    return;
+                }
+
+                teamManager.assignConnectedPlayers();
+
+                if (attemptsRemaining > 1) {
+                    scheduleConnectedPlayerAssignmentScan(
+                        scanSerial,
+                        attemptsRemaining - 1,
+                        CONNECTED_PLAYER_SCAN_INTERVAL_TICKS
+                    );
+                }
+            }
         );
     }
 
