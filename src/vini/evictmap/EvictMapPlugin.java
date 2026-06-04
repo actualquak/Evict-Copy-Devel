@@ -197,7 +197,7 @@ public class EvictMapPlugin extends Plugin {
         Events.on(PlayerJoin.class, event -> teamManager.handlePlayerJoin(event.player));
         Events.on(CoreChangeEvent.class, event -> teamManager.handleCoreChange(event.core));
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.8.0. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.8.1. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override
@@ -453,6 +453,13 @@ public class EvictMapPlugin extends Plugin {
         Vars.state.rules.infiniteResources = false;
         Vars.state.rules.attackMode = false;
 
+        /**
+         * Hosting with the vanilla PvP preset forces unit factories to 2x.
+         * Evict uses normal 1x unit-factory speed, so override that preset here
+         * after host-mode initialization.
+         */
+        Vars.state.rules.unitBuildSpeedMultiplier = 1f;
+
         Vars.state.rules.canGameOver = false;
         Vars.state.rules.cleanupDeadTeams = false;
         Vars.state.rules.coreCapture = false;
@@ -468,7 +475,7 @@ public class EvictMapPlugin extends Plugin {
         Vars.state.rules.loadout.clear();
 
         Log.info(
-            "[EvictMapGenerator] Applied Evict rules: pvp=ON, pvpAutoPause=OFF, waves=OFF, vanillaGameOver=OFF, defaultTeam=Fallen #@.",
+            "[EvictMapGenerator] Applied Evict rules: pvp=ON, pvpAutoPause=OFF, waves=OFF, vanillaGameOver=OFF, unitFactorySpeed=1x, defaultTeam=Fallen #@.",
             TeamManager.FALLEN_TEAM_ID
         );
     }
