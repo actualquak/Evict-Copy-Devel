@@ -2,7 +2,7 @@
   "name": "EvictMapGenerator",
   "author": "Vini2309",
   "main": "vini.evictmap.EvictMapPlugin",
-  "description": "Server-side Evict-style PvP generator with Fallen Nucleus restoration after surrender, double captured-hex cleanup around the five-second core replacement window, invites, claims, attrition, full assault, persistent resource tuning, early round ending and automatic random resets.",
-  "version": "0.10.3",
+  "description": "Server-side Evict-style PvP generator with procedural terrain, captures, claims, invites, surrender, early round endings, persistent tuning, attrition, full assault and a filtered paginated /help menu separating normal commands from discoverable development commands.",
+  "version": "0.10.4",
   "minGameVersion": "157.4"
 }
