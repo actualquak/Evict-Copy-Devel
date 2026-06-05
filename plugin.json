@@ -2,7 +2,7 @@
   "name": "EvictMapGenerator",
   "author": "Vini2309",
   "main": "vini.evictmap.EvictMapPlugin",
-  "description": "Server-side Evict-style PvP generator with procedural hex terrain, personal starts, delayed captures, immediate round resolution, revised 40/18/9 attrition, five-second team-scoped /fullassault refreshes, admin development commands and automatic random-seed resets.",
-  "version": "0.9.2",
+  "description": "Server-side Evict-style PvP generator with procedural hex terrain, personal starts, delayed captures, immediate round resolution, persistent attrition settings, persistent wall-template percentages, five-second team-scoped /fullassault refreshes, admin development commands and automatic random-seed resets.",
+  "version": "0.9.3",
   "minGameVersion": "157.4"
 }
