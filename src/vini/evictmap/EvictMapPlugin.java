@@ -233,7 +233,7 @@ public class EvictMapPlugin extends Plugin {
             evictCommands.update();
         });
 
-        Log.info("[EvictMapGenerator] Loaded. Code revision 0.9.5. Use 'evictstatus' for commands and current settings.");
+        Log.info("[EvictMapGenerator] Loaded. Code revision 0.9.6. Use 'evictstatus' for commands and current settings.");
     }
 
     @Override

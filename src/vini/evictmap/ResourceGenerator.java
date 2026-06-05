@@ -129,6 +129,38 @@ final class ResourceGenerator {
         new NoisePreset(Blocks.tar, 809, 21.0f, 0.935f, 2f, 0.35f, -0.08f, 4.5f, 105.0f, 0.024f);
 
     // ---------------------------------------------------------------------
+    // Liquid patch tuning
+    // ---------------------------------------------------------------------
+
+    /**
+     * 90% of generated liquid patches use the normal range.
+     * 10% use the rare larger range.
+     */
+    private static final double RARE_LIQUID_PATCH_CHANCE = 0.10;
+
+    /**
+     * Every playable hex receives one natural water patch. The later fallback
+     * still guarantees at least 2 tiles if a patch cannot fully grow because
+     * of local terrain constraints.
+     */
+    private static final int WATER_NORMAL_PATCH_MIN_SIZE = 4;
+    private static final int WATER_NORMAL_PATCH_MAX_SIZE = 6;
+    private static final int WATER_RARE_PATCH_MIN_SIZE = 7;
+    private static final int WATER_RARE_PATCH_MAX_SIZE = 12;
+    private static final int WATER_PATCH_LOCAL_RADIUS = 3;
+
+    /**
+     * Oil remains substantially rarer than water, but slightly more common
+     * than the previous sparse noise-only version.
+     */
+    private static final double TAR_PATCH_CHANCE_PER_HEX = 0.25;
+    private static final int TAR_NORMAL_PATCH_MIN_SIZE = 2;
+    private static final int TAR_NORMAL_PATCH_MAX_SIZE = 4;
+    private static final int TAR_RARE_PATCH_MIN_SIZE = 5;
+    private static final int TAR_RARE_PATCH_MAX_SIZE = 9;
+    private static final int TAR_PATCH_LOCAL_RADIUS = 3;
+
+    // ---------------------------------------------------------------------
     // Tiny fairness corrections
     // ---------------------------------------------------------------------
 
@@ -169,10 +201,14 @@ final class ResourceGenerator {
         CorrectionCounter corrections = new CorrectionCounter();
         NoisePreset[] orePresets = createOrePresets(settings);
 
-        // Floors first: tar does not overwrite water.
-        generateFloorNoise(seed, centers, WATER_PRESET);
+        /**
+         * Floors first: generate bounded liquid patches rather than
+         * unrestricted global blobs. Tar is placed after water and therefore
+         * never overwrites a water tile.
+         */
+        generateWaterPatches(seed, correctionRandom, centers, corrections);
         ensureMinimumWaterTiles(seed, correctionRandom, centers, corrections);
-        generateFloorNoise(seed, centers, TAR_PRESET);
+        generateTarPatches(seed, correctionRandom, centers, corrections);
 
         // Ores afterward. Later presets may naturally overwrite earlier ones.
         for (NoisePreset preset : orePresets) {
@@ -193,12 +229,146 @@ final class ResourceGenerator {
     static String presetDescription(EvictSettings settings) {
         return "persistent editor-style ores: "
             + settings.compactOreSettings()
-            + " + unchanged liquid presets + tiny per-hex fairness repairs";
+            + " + bounded water/oil patches with 10% rare large patches"
+            + " + tiny per-hex fairness repairs";
     }
 
     // ---------------------------------------------------------------------
     // Global noise generation
     // ---------------------------------------------------------------------
+
+    private static void generateWaterPatches(
+        int seed,
+        Random random,
+        List<HexCenter> centers,
+        CorrectionCounter corrections
+    ) {
+        for (HexCenter center : centers) {
+            TilePoint start = bestLiquidPatchStart(seed, center, WATER_PRESET);
+
+            if (start == null) {
+                continue;
+            }
+
+            int targetSize = choosePatchSize(
+                random,
+                WATER_NORMAL_PATCH_MIN_SIZE,
+                WATER_NORMAL_PATCH_MAX_SIZE,
+                WATER_RARE_PATCH_MIN_SIZE,
+                WATER_RARE_PATCH_MAX_SIZE
+            );
+
+            int placed = growFloorPatch(
+                seed,
+                WATER_PRESET,
+                center,
+                start,
+                Blocks.darksandWater,
+                targetSize,
+                WATER_PATCH_LOCAL_RADIUS
+            );
+
+            if (placed > 0) {
+                corrections.waterGeneratedPatches++;
+            }
+        }
+    }
+
+    private static void generateTarPatches(
+        int seed,
+        Random random,
+        List<HexCenter> centers,
+        CorrectionCounter corrections
+    ) {
+        for (HexCenter center : centers) {
+            if (random.nextDouble() >= TAR_PATCH_CHANCE_PER_HEX) {
+                continue;
+            }
+
+            TilePoint start = bestLiquidPatchStart(seed, center, TAR_PRESET);
+
+            if (start == null) {
+                continue;
+            }
+
+            int targetSize = choosePatchSize(
+                random,
+                TAR_NORMAL_PATCH_MIN_SIZE,
+                TAR_NORMAL_PATCH_MAX_SIZE,
+                TAR_RARE_PATCH_MIN_SIZE,
+                TAR_RARE_PATCH_MAX_SIZE
+            );
+
+            int placed = growFloorPatch(
+                seed,
+                TAR_PRESET,
+                center,
+                start,
+                Blocks.tar,
+                targetSize,
+                TAR_PATCH_LOCAL_RADIUS
+            );
+
+            if (placed > 0) {
+                corrections.tarGeneratedPatches++;
+            }
+        }
+    }
+
+    private static int choosePatchSize(
+        Random random,
+        int normalMinimum,
+        int normalMaximum,
+        int rareMinimum,
+        int rareMaximum
+    ) {
+        boolean rare = random.nextDouble() < RARE_LIQUID_PATCH_CHANCE;
+
+        return rare
+            ? inclusiveRandom(random, rareMinimum, rareMaximum)
+            : inclusiveRandom(random, normalMinimum, normalMaximum);
+    }
+
+    private static TilePoint bestLiquidPatchStart(
+        int seed,
+        HexCenter center,
+        NoisePreset preset
+    ) {
+        TilePoint best = null;
+        float bestNoise = -Float.MAX_VALUE;
+
+        for (
+            int y = center.y - LIQUID_MAX_RADIUS;
+            y <= center.y + LIQUID_MAX_RADIUS;
+            y++
+        ) {
+            for (
+                int x = center.x - LIQUID_MAX_RADIUS;
+                x <= center.x + LIQUID_MAX_RADIUS;
+                x++
+            ) {
+                Tile tile = Vars.world.tile(x, y);
+
+                if (
+                    tile == null
+                        || tile.block() != Blocks.air
+                        || tile.floor() != Blocks.darksand
+                        || !insideLiquidMaskForCenter(x, y, center)
+                ) {
+                    continue;
+                }
+
+                float noise = sample(seed, preset, x, y);
+
+                if (noise > bestNoise) {
+                    bestNoise = noise;
+                    best = new TilePoint(x, y);
+                }
+            }
+        }
+
+        return best;
+    }
 
     private static void generateFloorNoise(
         int seed,
@@ -336,41 +506,7 @@ final class ResourceGenerator {
         int seed,
         HexCenter center
     ) {
-        TilePoint best = null;
-        float bestNoise = -Float.MAX_VALUE;
-
-        for (
-            int y = center.y - LIQUID_MAX_RADIUS;
-            y <= center.y + LIQUID_MAX_RADIUS;
-            y++
-        ) {
-            for (
-                int x = center.x - LIQUID_MAX_RADIUS;
-                x <= center.x + LIQUID_MAX_RADIUS;
-                x++
-            ) {
-                TilePoint point = new TilePoint(x, y);
-                Tile tile = Vars.world.tile(x, y);
-
-                if (
-                    tile == null
-                        || tile.block() != Blocks.air
-                        || tile.floor() != Blocks.darksand
-                        || !insideLiquidMaskForCenter(x, y, center)
-                ) {
-                    continue;
-                }
-
-                float noise = sample(seed, WATER_PRESET, x, y);
-
-                if (noise > bestNoise) {
-                    bestNoise = noise;
-                    best = point;
-                }
-            }
-        }
-
-        return best;
+        return bestLiquidPatchStart(seed, center, WATER_PRESET);
     }
 
     // ---------------------------------------------------------------------
@@ -867,6 +1003,8 @@ final class ResourceGenerator {
             scrapTiles,
             titaniumTiles,
             thoriumTiles,
+            corrections.waterGeneratedPatches,
+            corrections.tarGeneratedPatches,
             corrections.waterFallbackRepairs,
             corrections.oreFallbackRepairs
         );
@@ -884,6 +1022,8 @@ final class ResourceGenerator {
         int scrapTiles,
         int titaniumTiles,
         int thoriumTiles,
+        int waterGeneratedPatches,
+        int tarGeneratedPatches,
         int waterFallbackRepairs,
         int oreFallbackRepairs
     ) {
@@ -896,6 +1036,8 @@ final class ResourceGenerator {
                 + ", scrap=" + scrapTiles
                 + ", titanium=" + titaniumTiles
                 + ", thorium=" + thoriumTiles
+                + ", waterPatches=" + waterGeneratedPatches
+                + ", tarPatches=" + tarGeneratedPatches
                 + ", waterFallbackRepairs=" + waterFallbackRepairs
                 + ", oreFallbackRepairs=" + oreFallbackRepairs;
         }
@@ -922,6 +1064,8 @@ final class ResourceGenerator {
     }
 
     private static final class CorrectionCounter {
+        private int waterGeneratedPatches;
+        private int tarGeneratedPatches;
         private int waterFallbackRepairs;
         private int oreFallbackRepairs;
     }
