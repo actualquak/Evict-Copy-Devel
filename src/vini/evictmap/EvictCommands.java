@@ -14,6 +14,8 @@ import mindustry.gen.Unit;
 import mindustry.type.UnitType;
 import mindustry.world.blocks.storage.CoreBlock.CoreBuild;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -57,6 +59,12 @@ final class EvictCommands {
             "fullassault",
             "Toggle automatic attacks against the closest enemy core for your team's unattended combat units.",
             (args, player) -> toggleFullAssault(player)
+        );
+
+        handler.<Player>register(
+                "time",
+                "Display the game time elapsed",
+                (args, player) -> showTime(player)
         );
 
         handler.<Player>register(
@@ -464,6 +472,29 @@ final class EvictCommands {
                 + targetTeam.id
                 + ".[]"
         );
+    }
+
+    private void showTime(
+            Player player
+    ) {
+        Duration dur = Duration.between(teamManager.timeWhenRoundStarted, Instant.now());
+        StringBuilder builder = new StringBuilder();
+        builder.append(dur.toHoursPart());
+        if(dur.toHoursPart() == 1)
+            builder.append(" hour, ");
+        else
+            builder.append(" hours, ");
+        builder.append(dur.toMinutesPart());
+        if(dur.toMinutesPart() == 1)
+            builder.append(" minute and ");
+        else
+            builder.append(" minutes and ");
+        builder.append(dur.toSecondsPart());
+        if(dur.toSecondsPart() == 1)
+            builder.append(" second have elapsed since the game started");
+        else
+            builder.append(" seconds have elapsed since the game started");
+        player.sendMessage(builder.toString());
     }
 
     private boolean requireAdmin(Player player) {

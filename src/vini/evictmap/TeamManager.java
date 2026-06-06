@@ -2,6 +2,7 @@ package vini.evictmap;
 
 import arc.func.Cons;
 import arc.util.Log;
+import arc.util.Time;
 import mindustry.Vars;
 import mindustry.content.Blocks;
 import mindustry.game.Team;
@@ -12,6 +13,8 @@ import mindustry.gen.Unit;
 import mindustry.world.Tile;
 import mindustry.world.blocks.storage.CoreBlock.CoreBuild;
 
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -97,6 +100,8 @@ final class TeamManager {
     private boolean suppressCoreChangeEvents = false;
     private long roundSerial = 0L;
 
+    public Instant timeWhenRoundStarted;
+
     TeamManager(Cons<Team> victoryHandler) {
         this.victoryHandler = victoryHandler;
     }
@@ -130,6 +135,8 @@ final class TeamManager {
         roundActivated = false;
         resetting = false;
         roundActive = true;
+
+        timeWhenRoundStarted = Instant.now();
 
         Log.info(
             "[EvictMapGenerator] Team round initialized. Fallen team=#@, neutralHexes=@, allowedPersonalTeams=#@..#@ except #@.",
