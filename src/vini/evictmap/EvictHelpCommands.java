@@ -7,8 +7,6 @@ import arc.util.CommandHandler.Command;
 import arc.util.Strings;
 import mindustry.gen.Player;
 
-import java.util.HashSet;
-import java.util.Set;
 
 /**
  * Replaces vanilla /help with a filtered Evict help menu.
@@ -25,16 +23,6 @@ import java.util.Set;
 final class EvictHelpCommands {
 
     private static final int COMMANDS_PER_PAGE = 6;
-
-    private static final Set<String> DEV_COMMANDS = new HashSet<>();
-
-    static {
-        DEV_COMMANDS.add("forceend");
-        DEV_COMMANDS.add("attrition");
-        DEV_COMMANDS.add("wall");
-        DEV_COMMANDS.add("corecap");
-        DEV_COMMANDS.add("spawnunit");
-    }
 
     void registerClientCommands(CommandHandler handler) {
         /**
@@ -134,7 +122,7 @@ final class EvictHelpCommands {
         Seq<Command> result = new Seq<>();
 
         for (Command command : handler.getCommandList()) {
-            boolean isDevCommand = DEV_COMMANDS.contains(command.text);
+            boolean isDevCommand = EvictCommandCatalog.DEV_COMMANDS.contains(command.text);
 
             if (devCommands == isDevCommand) {
                 result.add(command);

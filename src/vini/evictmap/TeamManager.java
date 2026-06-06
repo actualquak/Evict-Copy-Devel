@@ -2,7 +2,6 @@ package vini.evictmap;
 
 import arc.func.Cons;
 import arc.util.Log;
-import arc.util.Time;
 import mindustry.Vars;
 import mindustry.content.Blocks;
 import mindustry.game.Team;
@@ -74,23 +73,6 @@ final class TeamManager {
 
     private static final long TEAM_RANDOM_XOR = 0x5445414d2d455649L;
 
-    /**
-     * Captures intentionally do not complete instantly. The empty center is
-     * visible for a few seconds before the attacker's small Core Shard appears.
-     */
-    private static final float CAPTURE_DELAY_TICKS = 5f * 60f;
-
-    /**
-     * Capture cleanup follows the real Evict core range exactly.
-     *
-     * Every synthetic building whose center is within 40 tiles of the
-     * destroyed core is removed, including buildings inside the overlap with
-     * a neighbouring hex. This is intentionally core range, not build range.
-     */
-    private static final int CAPTURE_CLEAR_RADIUS = 40;
-    private static final int CAPTURE_CLEAR_RADIUS_SQUARED =
-        CAPTURE_CLEAR_RADIUS * CAPTURE_CLEAR_RADIUS;
-
     private final List<HexSlot> slots = new ArrayList<>();
     private final Map<String, Integer> teamIdByPlayerUuid = new HashMap<>();
     private final Map<Integer, String> playerNameByTeamId = new HashMap<>();
@@ -106,6 +88,7 @@ final class TeamManager {
 
     private final Cons<Team> victoryHandler;
     private InviteManager inviteManager;
+    private final CaptureManager captureManager = new CaptureManager(this);
 
     private Random random = new Random();
     private boolean roundActive = false;
@@ -412,211 +395,10 @@ final class TeamManager {
         CoreBuild core,
         AttritionManager attritionManager
     ) {
-        if (
-            !roundActive
-                || resetting
-                || suppressCoreChangeEvents
-                || core == null
-                || core.health > 0f
-                || core.tile == null
-        ) {
-            return;
-        }
-
-        HexSlot slot = findSlotByCoreTile(core.tile.x, core.tile.y);
-
-        if (slot == null || slot.capturing) {
-            return;
-        }
-
-        Team defenderTeam = core.team;
-        Team attackerTeam = validCaptureAttacker(core.lastDamage, defenderTeam);
-
-        slot.capturing = true;
-        slot.pendingCaptureTeamId = attackerTeam.id;
-
-        if (attackerTeam != defenderTeam) {
-            updateMaximumOwnedHexes(attackerTeam.id);
-        }
-
-        long scheduledRoundSerial = roundSerial;
-
-        Log.info(
-            "[EvictMapGenerator] Core destroyed at hex (@,@). defender=#@ attacker=#@. Clearing buildings and placing a Core Shard in 5 seconds.",
-            slot.col,
-            slot.row,
-            defenderTeam.id,
-            attackerTeam.id
-        );
-
-        /**
-         * CoreChangeEvent fires from the core destruction lifecycle itself.
-         * Delay the wipe until the next update so the vanilla removal can
-         * finish before additional networked tile removals are sent.
-         */
-        Time.run(
-            0f,
-            () -> beginDelayedCapture(
-                slot,
-                defenderTeam,
-                attackerTeam,
-                scheduledRoundSerial,
-                attritionManager
-            )
-        );
+        captureManager.handleCoreChange(core, attritionManager);
     }
 
-    private void beginDelayedCapture(
-        HexSlot slot,
-        Team defenderTeam,
-        Team attackerTeam,
-        long scheduledRoundSerial,
-        AttritionManager attritionManager
-    ) {
-        if (
-            !roundActive
-                || resetting
-                || scheduledRoundSerial != roundSerial
-                || !slot.capturing
-        ) {
-            return;
-        }
-
-        if (attackerTeam != defenderTeam) {
-            recordCoreDestruction(defenderTeam, attackerTeam);
-        }
-
-        int removedBuildings = clearSyntheticBuildingsInsideHex(slot);
-        int attritionDeaths =
-            attritionManager.applyCaptureAttrition(slot.x, slot.y);
-
-        Log.info(
-            "[EvictMapGenerator] Cleared @ synthetic buildings and removed @ units through capture attrition from hex (@,@).",
-            removedBuildings,
-            attritionDeaths,
-            slot.col,
-            slot.row
-        );
-
-        /**
-         * Ownership changes logically as soon as the old core is destroyed.
-         * The replacement Core Shard remains delayed for visual/gameplay
-         * parity, but elimination and victory messages must not wait five
-         * seconds for that replacement block.
-         */
-        if (attackerTeam != defenderTeam) {
-            announceEliminationIfNeeded(defenderTeam, attackerTeam);
-        }
-
-        checkVictory();
-
-        if (!roundActive || resetting) {
-            Log.info(
-                "[EvictMapGenerator] Final capture resolved the round before replacement Core Shard placement."
-            );
-            return;
-        }
-
-        Log.info(
-            "[EvictMapGenerator] Waiting 5 seconds for team #@ Core Shard at captured hex (@,@).",
-            attackerTeam.id,
-            slot.col,
-            slot.row
-        );
-
-        Time.run(
-            CAPTURE_DELAY_TICKS,
-            () -> finishDelayedCapture(
-                slot,
-                defenderTeam,
-                attackerTeam,
-                scheduledRoundSerial
-            )
-        );
-    }
-
-    private void finishDelayedCapture(
-        HexSlot slot,
-        Team defenderTeam,
-        Team attackerTeam,
-        long scheduledRoundSerial
-    ) {
-        if (
-            !roundActive
-                || resetting
-                || scheduledRoundSerial != roundSerial
-                || !slot.capturing
-        ) {
-            return;
-        }
-
-        Tile centerTile = Vars.world.tile(slot.x, slot.y);
-
-        if (centerTile == null) {
-            Log.err(
-                "[EvictMapGenerator] Cannot finish capture: missing center tile for hex (@,@).",
-                slot.col,
-                slot.row
-            );
-            slot.capturing = false;
-            return;
-        }
-
-        /**
-         * Wipe the complete captured hex a second time immediately before the
-         * replacement core appears.
-         *
-         * This intentionally removes anything built during the five-second
-         * empty-core window. Without the second wipe, players could abuse that
-         * delay to preserve or quickly establish buildings in the captured
-         * hex before the replacement Core Shard appears.
-         */
-        int delayedWindowRemovedBuildings =
-            clearSyntheticBuildingsInsideHex(slot);
-
-        Log.info(
-            "[EvictMapGenerator] Removed @ synthetic buildings built or remaining during the 5-second capture window at hex (@,@).",
-            delayedWindowRemovedBuildings,
-            slot.col,
-            slot.row
-        );
-
-        /**
-         * The center should now be empty. Clear any unexpected synthetic
-         * remnant and place the attacker's small 3x3 Core Shard without adding
-         * any bonus items.
-         */
-        if (centerTile.synthetic()) {
-            centerTile.removeNet();
-        }
-
-        centerTile.setNet(Blocks.coreShard, attackerTeam, 0);
-
-        /**
-         * Do not clear capturedCore.items here.
-         *
-         * Mindustry intentionally shares one ItemModule between every core of
-         * the same team. Clearing the new Core Shard would therefore erase the
-         * attacker's resources from all existing cores as well.
-         *
-         * A captured shard adds no bonus resources; it simply joins the
-         * attacker's already shared core inventory.
-         */
-        slot.ownerTeamId = attackerTeam.id;
-        slot.pendingCaptureTeamId = attackerTeam.id;
-        slot.capturing = false;
-
-        Log.info(
-            "[EvictMapGenerator] Capture complete at hex (@,@): team #@ -> team #@ with a Core Shard and no bonus items.",
-            slot.col,
-            slot.row,
-            defenderTeam.id,
-            attackerTeam.id
-        );
-
-    }
-
-    private void announceEliminationIfNeeded(
+    void announceEliminationIfNeeded(
         Team defenderTeam,
         Team attackerTeam
     ) {
@@ -662,7 +444,7 @@ final class TeamManager {
         );
     }
 
-    private void recordCoreDestruction(
+    void recordCoreDestruction(
         Team defenderTeam,
         Team attackerTeam
     ) {
@@ -835,7 +617,7 @@ final class TeamManager {
         return count;
     }
 
-    private void updateMaximumOwnedHexes(int teamId) {
+    void updateMaximumOwnedHexes(int teamId) {
         if (teamId == FALLEN_TEAM_ID || teamId == Team.derelict.id) {
             return;
         }
@@ -1081,7 +863,7 @@ final class TeamManager {
         return true;
     }
 
-    private void checkVictory() {
+    void checkVictory() {
         if (
             !roundActive
                 || resetting
@@ -1262,57 +1044,6 @@ final class TeamManager {
             : playerName;
     }
 
-    private Team validCaptureAttacker(Team lastDamage, Team defenderTeam) {
-        /**
-         * Normal PvP damage stores the real attacking team in CoreBuild.
-         * If an admin command, environment effect or unusual edge case removes
-         * a core without a valid enemy source, restore the hex to its previous
-         * owner instead of creating a derelict or permanently dead hex.
-         */
-        if (
-            lastDamage == null
-                || lastDamage == Team.derelict
-                || lastDamage == defenderTeam
-        ) {
-            return defenderTeam;
-        }
-
-        return lastDamage;
-    }
-
-    private int clearSyntheticBuildingsInsideHex(HexSlot capturedSlot) {
-        List<Tile> centersToRemove = new ArrayList<>();
-
-        for (Tile tile : Vars.world.tiles) {
-            if (
-                tile != null
-                    && tile.build != null
-                    && tile.isCenter()
-                    && tile.synthetic()
-                    && belongsToHex(tile.x, tile.y, capturedSlot)
-            ) {
-                centersToRemove.add(tile);
-            }
-        }
-
-        for (Tile tile : centersToRemove) {
-            if (
-                tile.build != null
-                    && tile.isCenter()
-                    && tile.synthetic()
-            ) {
-                tile.removeNet();
-            }
-        }
-
-        return centersToRemove.size();
-    }
-
-    private boolean belongsToHex(int tileX, int tileY, HexSlot candidate) {
-        return squaredDistance(tileX, tileY, candidate)
-            <= CAPTURE_CLEAR_RADIUS_SQUARED;
-    }
-
     private long squaredDistance(int tileX, int tileY, HexSlot slot) {
         long dx = tileX - slot.x;
         long dy = tileY - slot.y;
@@ -1320,18 +1051,20 @@ final class TeamManager {
         return dx * dx + dy * dy;
     }
 
-    private HexSlot findSlotByCoreTile(int x, int y) {
-        for (HexSlot slot : slots) {
-            if (slot.x == x && slot.y == y) {
-                return slot;
-            }
-        }
-
-        return null;
-    }
-
     private int effectiveOwnerTeamId(HexSlot slot) {
         return slot.capturing ? slot.pendingCaptureTeamId : slot.ownerTeamId;
+    }
+
+    List<HexSlot> slots() {
+        return slots;
+    }
+
+    long roundSerial() {
+        return roundSerial;
+    }
+
+    boolean isCaptureSuppressed() {
+        return suppressCoreChangeEvents;
     }
 
     boolean isRoundActiveForSystems() {
@@ -1511,15 +1244,15 @@ final class TeamManager {
     }
 
     static final class HexSlot {
-        private final int col;
-        private final int row;
-        private final int x;
-        private final int y;
-        private final int protectedSides;
+        final int col;
+        final int row;
+        final int x;
+        final int y;
+        final int protectedSides;
 
-        private int ownerTeamId = FALLEN_TEAM_ID;
-        private boolean capturing = false;
-        private int pendingCaptureTeamId = FALLEN_TEAM_ID;
+        int ownerTeamId = FALLEN_TEAM_ID;
+        boolean capturing = false;
+        int pendingCaptureTeamId = FALLEN_TEAM_ID;
 
         HexSlot(
             int col,
